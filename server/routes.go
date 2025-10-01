@@ -1977,9 +1977,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 		applyStructuredOutputs := false
 
 		for {
-			var initialOutput strings.Builder
 			var tb strings.Builder
-			shouldCapture := req.Format != nil && !structuredOutputsStarted
 
 			currentFormat := req.Format
 			if req.Format != nil && !structuredOutputsStarted {
@@ -1994,9 +1992,6 @@ func (s *Server) ChatHandler(c *gin.Context) {
 				Format:  currentFormat,
 				Options: opts,
 			}, func(r llm.CompletionResponse) {
-				if shouldCapture {
-					initialOutput.WriteString(r.Content)
-				}
 				res := api.ChatResponse{
 					Model:     req.Model,
 					CreatedAt: time.Now().UTC(),
@@ -2051,8 +2046,18 @@ func (s *Server) ChatHandler(c *gin.Context) {
 						// need to accumulate more to decide what to send
 						return
 					}
-					res.Message.Content = remainingContent
+					slog.Debug("thinking state", "thinking", thinkingContent, "remaining", remainingContent)
 					res.Message.Thinking = thinkingContent
+					tb.WriteString(thinkingContent)
+
+					if !structuredOutputsStarted && req.Format != nil && tb.String() != "" && remainingContent != "" {
+						applyStructuredOutputs = true
+						res.Message.Content = ""
+						ch <- res // flush anything remaining in thinking to user. case where there is both thinking and content with no boundary. e.g. token </think> content
+						requestCancel()
+						return
+					}
+					res.Message.Content = remainingContent
 				}
 
 				if len(req.Tools) > 0 {
