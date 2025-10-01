@@ -461,119 +461,79 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	structuredOutputsStarted := false
 	ch := make(chan any)
+
+	ch := make(chan any)
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
 		var sb strings.Builder
 		defer close(ch)
-		defer cancel()
-
-		applyStructuredOutputs := false
-
-		for {
-			var initialOutput strings.Builder
-			shouldCapture := req.Format != nil && !structuredOutputsStarted
-
-			attemptFormat := req.Format
-			if req.Format != nil && !structuredOutputsStarted {
-				attemptFormat = nil
+		if err := r.Completion(c.Request.Context(), llm.CompletionRequest{
+			Prompt:  prompt,
+			Images:  images,
+			Format:  req.Format,
+			Options: opts,
+		}, func(cr llm.CompletionResponse) {
+			res := api.GenerateResponse{
+				Model:     req.Model,
+				CreatedAt: time.Now().UTC(),
+				Response:  cr.Content,
+				Done:      cr.Done,
+				Metrics: api.Metrics{
+					PromptEvalCount:    cr.PromptEvalCount,
+					PromptEvalDuration: cr.PromptEvalDuration,
+					EvalCount:          cr.EvalCount,
+					EvalDuration:       cr.EvalDuration,
+				},
 			}
 
-			// sets up new context given parent context
-			requestCtx, requestCancel := context.WithCancel(ctx)
-			err := r.Completion(requestCtx, llm.CompletionRequest{
-				Prompt:  prompt,
-				Images:  images,
-				Format:  attemptFormat,
-				Options: opts,
-			}, func(cr llm.CompletionResponse) {
-				if shouldCapture {
-					initialOutput.WriteString(cr.Content)
+			if builtinParser != nil {
+				content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
+				if err != nil {
+					ch <- gin.H{"error": err.Error()}
+					return
 				}
-				res := api.GenerateResponse{
-					Model:     req.Model,
-					CreatedAt: time.Now().UTC(),
-					Response:  cr.Content,
-					Done:      cr.Done,
-					Metrics: api.Metrics{
-						PromptEvalCount:    cr.PromptEvalCount,
-						PromptEvalDuration: cr.PromptEvalDuration,
-						EvalCount:          cr.EvalCount,
-						EvalDuration:       cr.EvalDuration,
-					},
+				res.Response = content
+				res.Thinking = thinking
+				if cr.Done && len(toolCalls) > 0 {
+					res.ToolCalls = toolCalls
 				}
+			} else if thinkingState != nil {
+				thinking, content := thinkingState.AddContent(cr.Content)
+				res.Thinking = thinking
+				res.Response = content
+			}
 
-				if builtinParser != nil {
-					content, thinking, toolCalls, err := builtinParser.Add(cr.Content, cr.Done)
+			if _, err := sb.WriteString(cr.Content); err != nil {
+				ch <- gin.H{"error": err.Error()}
+			}
+
+			if cr.Done {
+				res.DoneReason = cr.DoneReason.String()
+				res.TotalDuration = time.Since(checkpointStart)
+				res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
+
+				if !req.Raw {
+					tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
 					if err != nil {
 						ch <- gin.H{"error": err.Error()}
 						return
 					}
-					res.Response = content
-					res.Thinking = thinking
-					if cr.Done && len(toolCalls) > 0 {
-						res.ToolCalls = toolCalls
-					}
-
-					// the parser has indicated that it's ready to constrain. cancel the current context
-					if readyToConstrainParser, ok := builtinParser.(interface{ ReadyToConstrain() bool }); ok && req.Format != nil && !structuredOutputsStarted && readyToConstrainParser.ReadyToConstrain() {
-						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser ready to constrain", "parser", m.Config.Parser)
-						applyStructuredOutputs = true
-						requestCancel()
-					}
-				} else if thinkingState != nil {
-					thinking, content := thinkingState.AddContent(cr.Content)
-					res.Thinking = thinking
-					res.Response = content
-				}
-
-				if _, err := sb.WriteString(cr.Content); err != nil {
-					ch <- gin.H{"error": err.Error()}
-				}
-
-				if cr.Done {
-					res.DoneReason = cr.DoneReason.String()
-					res.TotalDuration = time.Since(checkpointStart)
-					res.LoadDuration = checkpointLoaded.Sub(checkpointStart)
-
-					if !req.Raw {
-						tokens, err := r.Tokenize(c.Request.Context(), prompt+sb.String())
-						if err != nil {
-							ch <- gin.H{"error": err.Error()}
-							return
-						}
-						res.Context = tokens
-					}
-				}
-
-				if builtinParser != nil {
-					// only send messages with meaningful content (empty messages confuse clients)
-					if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 {
-						ch <- res
-					}
-
-					return
-				}
-
-				ch <- res
-			})
-			if err != nil {
-				if applyStructuredOutputs && !structuredOutputsStarted && (errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "context canceled")) && ctx.Err() == nil {
-					// only ignores error if it's a context cancellation due to setting structured outputs
-				} else {
-					ch <- gin.H{"error": err.Error()}
-					return
+					res.Context = tokens
 				}
 			}
 
-			// ignored structured outputs cancellation falls through to here, start a new request with the structured outputs and updated prompt
-			if applyStructuredOutputs && !structuredOutputsStarted {
-				structuredOutputsStarted = true
-				applyStructuredOutputs = false
-				prompt += initialOutput.String()
-				continue
+			if builtinParser != nil {
+				// only send messages with meaningful content (empty messages confuse clients)
+				if res.Response != "" || res.Thinking != "" || res.Done || len(res.ToolCalls) > 0 {
+					ch <- res
+				}
+
+				return
 			}
 
-			break
+			ch <- res
+		}); err != nil {
+			ch <- gin.H{"error": err.Error()}
 		}
 	}()
 
@@ -2022,11 +1982,12 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 		for {
 			var initialOutput strings.Builder
+			var tb strings.Builder
 			shouldCapture := req.Format != nil && !structuredOutputsStarted
 
-			attemptFormat := req.Format
+			currentFormat := req.Format
 			if req.Format != nil && !structuredOutputsStarted {
-				attemptFormat = nil
+				currentFormat = nil
 			}
 
 			// sets up new context given parent context
@@ -2034,7 +1995,7 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			err := r.Completion(requestCtx, llm.CompletionRequest{
 				Prompt:  prompt,
 				Images:  images,
-				Format:  attemptFormat,
+				Format:  currentFormat,
 				Options: opts,
 			}, func(r llm.CompletionResponse) {
 				if shouldCapture {
@@ -2071,20 +2032,21 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					res.Message.Thinking = thinking
 					res.Message.ToolCalls = toolCalls
 
+					tb.WriteString(thinking)
+					if !structuredOutputsStarted && req.Format != nil && tb.String() != "" && res.Message.Content != "" {
+						slog.Debug("applying structured outputs", "parser", m.Config.Parser)
+						applyStructuredOutputs = true
+						requestCancel()
+						return
+					}
+
 					if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done {
 						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser output", "parser", m.Config.Parser, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
 						ch <- res
+						return
 					} else {
 						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser empty output", "parser", m.Config.Parser)
 					}
-
-					// the parser has indicated that it's ready to constrain. cancel the current context
-					if readyToConstrainParser, ok := builtinParser.(interface{ ReadyToConstrain() bool }); ok && req.Format != nil && !structuredOutputsStarted && readyToConstrainParser.ReadyToConstrain() {
-						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser ready to constrain", "parser", m.Config.Parser)
-						applyStructuredOutputs = true
-						requestCancel()
-					}
-					return
 				}
 
 				if thinkingState != nil {
@@ -2131,7 +2093,22 @@ func (s *Server) ChatHandler(c *gin.Context) {
 			if applyStructuredOutputs && !structuredOutputsStarted {
 				structuredOutputsStarted = true
 				applyStructuredOutputs = false
-				prompt += initialOutput.String()
+				msg := api.Message{
+					Role:     "assistant",
+					Thinking: tb.String(),
+				}
+
+				msgs = append(msgs, msg)
+				prompt, _, err = chatPrompt(c.Request.Context(), m, r.Tokenize, opts, msgs, processedTools, req.Think)
+				if err != nil {
+					slog.Error("chat prompt error applying structured outputs", "error", err)
+					ch <- gin.H{"error": err.Error()}
+					return
+				}
+				// force constraining by terminating thinking header, the parser is already at this state
+				if shouldUseHarmony(m) {
+					prompt += "<|end|><|start|>assistant<|channel|>final<|message|>"
+				}
 				continue
 			}
 
