@@ -458,10 +458,6 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(c.Request.Context())
-	structuredOutputsStarted := false
-	ch := make(chan any)
-
 	ch := make(chan any)
 	go func() {
 		// TODO (jmorganca): avoid building the response twice both here and below
@@ -2043,10 +2039,10 @@ func (s *Server) ChatHandler(c *gin.Context) {
 					if res.Message.Content != "" || res.Message.Thinking != "" || len(res.Message.ToolCalls) > 0 || r.Done {
 						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser output", "parser", m.Config.Parser, "content", content, "thinking", thinking, "toolCalls", toolCalls, "done", r.Done)
 						ch <- res
-						return
 					} else {
 						slog.Log(context.TODO(), logutil.LevelTrace, "builtin parser empty output", "parser", m.Config.Parser)
 					}
+					return
 				}
 
 				if thinkingState != nil {

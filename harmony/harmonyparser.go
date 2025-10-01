@@ -268,7 +268,6 @@ type HarmonyMessageHandler struct {
 	FunctionNameMap *FunctionNameMap
 	toolAccumulator *HarmonyToolCallAccumulator
 	convertedTools  map[string]struct{}
-	AllowConstrain  bool
 }
 
 // NewHarmonyMessageHandler creates a new message handler
@@ -282,7 +281,6 @@ func NewHarmonyMessageHandler() *HarmonyMessageHandler {
 		},
 		FunctionNameMap: NewFunctionNameMap(),
 		convertedTools:  make(map[string]struct{}),
-		AllowConstrain:  false,
 	}
 }
 
@@ -317,7 +315,6 @@ func (h *HarmonyMessageHandler) AddContent(content string, toolParser *HarmonyTo
 					h.state = harmonyMessageState_Normal
 				}
 			case "final":
-				h.AllowConstrain = true
 				h.state = harmonyMessageState_Normal
 			}
 		case HarmonyEventContentEmitted:
@@ -452,10 +449,6 @@ func (h *HarmonyMessageHandler) Add(s string, done bool) (content string, thinki
 	}
 
 	return content, thinking, calls, nil
-}
-
-func (h *HarmonyMessageHandler) ReadyToConstrain() bool {
-	return h.AllowConstrain
 }
 
 // HasToolSupport implements the Parser interface
