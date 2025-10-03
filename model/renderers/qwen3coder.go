@@ -82,8 +82,6 @@ func Qwen3CoderRenderer(messages []api.Message, tools []api.Tool, _ *api.ThinkVa
 
 		sb.WriteString(systemMessage)
 
-		// this is tools
-
 		if len(tools) > 0 {
 			sb.WriteString("\n\n# Tools\n\nYou have access to the following functions:\n\n")
 			sb.WriteString("<tools>")
@@ -101,9 +99,7 @@ func Qwen3CoderRenderer(messages []api.Message, tools []api.Tool, _ *api.ThinkVa
 					sb.WriteString("\n<name>" + name + "</name>")
 
 					if len(prop.Type) > 0 {
-						// TODO(!!!)(drifkin): we should match the reference implementation for
-						// more complex types here instead of using this format
-						sb.WriteString("\n<type>" + prop.ToTypeScriptType() + "</type>")
+						sb.WriteString("\n<type>" + formatToolDefinitionType(prop.Type) + "</type>")
 					}
 
 					if prop.Description != "" {
@@ -134,12 +130,8 @@ func Qwen3CoderRenderer(messages []api.Message, tools []api.Tool, _ *api.ThinkVa
 			sb.WriteString("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
 		}
 
-		// adds imEndTag
-
 		sb.WriteString(imEndTag + "\n")
 	}
-
-	// this is the start of the messages
 
 	for i, message := range filteredMessages {
 		lastMessage := i == len(filteredMessages)-1
@@ -220,4 +212,25 @@ func formatToolCallArgument(value any) string {
 	}
 
 	return fmt.Sprintf("%v", value)
+}
+
+func formatToolDefinitionType(tp api.PropertyType) string {
+	if len(tp) == 0 {
+		return "[]"
+	}
+
+	if len(tp) == 1 {
+		return tp[0]
+	}
+
+	// TODO(drifkin): it would be nice to format the JSON here similarly to
+	// python's default json.dumps behavior (spaces after commas and colons).
+	// This would let us be byte-for-byte compatible with the reference
+	// implementation for most common inputs
+	jsonBytes, err := json.Marshal(tp)
+	if err != nil {
+		return "[]"
+	}
+
+	return string(jsonBytes)
 }
